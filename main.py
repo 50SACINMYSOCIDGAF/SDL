@@ -87,28 +87,94 @@ class EnhancedSparseAutoencoder(nn.Module):
         self.sparsity_controller = AdaptiveSparsityController()
         self.feature_history = []
         self.semantic_cache = {}
+        self.eps = 1e-6
 
-    def compute_feature_diversity(self, activations):
+    def compute_feature_statistics(self, activations):
         with torch.autocast(device_type='cuda', enabled=False):
-            activations_float = activations.float()
-            corr = torch.corrcoef(activations_float.T)
-            eigenvalues = torch.linalg.eigvalsh(corr)
-            return torch.var(eigenvalues / eigenvalues.sum())
+            act = activations.float()
+            act_norm = act / (torch.norm(act, dim=1, keepdim=True) + self.eps)
+
+            # Compute coherence
+            gram = torch.mm(act_norm, act_norm.t())
+            off_diag = torch.triu(gram, diagonal=1)
+            coherence = torch.mean(torch.abs(off_diag))
+
+            # Compute diversity
+            _, s, _ = torch.svd(act, compute_uv=False)
+            s_norm = s / (torch.sum(s) + self.eps)
+            diversity = 1 - torch.sum(s_norm * s_norm)
+
+            # Compute stability
+            mean_act = torch.mean(act, dim=0)
+            std_act = torch.std(act, dim=0)
+            stability = torch.mean(mean_act / (std_act + self.eps))
+
+            # Normalise metrics
+            coherence = torch.clamp(coherence, 0, 1)
+            diversity = torch.clamp(diversity, 0, 1)
+            stability = torch.sigmoid(stability)
+
+            return coherence.item(), diversity.item(), stability.item()
 
     def track_semantic_consistency(self, activations, batch_id):
         with torch.autocast(device_type='cuda', enabled=False):
-            activations_float = activations.float()
+            act = activations.float()
+
             if batch_id in self.semantic_cache:
-                prev = self.semantic_cache[batch_id].float()
-                cos_sim = nn.CosineSimilarity(dim=1)(activations_float, prev)
-                self.semantic_cache[batch_id] = activations_float.detach()
-                return cos_sim.mean().item()
-            self.semantic_cache[batch_id] = activations_float.detach()
+                prev_act = self.semantic_cache[batch_id].float()
+
+                act_norm = act / (torch.norm(act, dim=1, keepdim=True) + self.eps)
+                prev_norm = prev_act / (torch.norm(prev_act, dim=1, keepdim=True) + self.eps)
+
+                consistency = torch.mean(torch.sum(act_norm * prev_norm, dim=1))
+
+                self.semantic_cache[batch_id] = 0.9 * prev_act + 0.1 * act.detach()
+
+                return consistency.item()
+
+            self.semantic_cache[batch_id] = act.detach()
             return 1.0
 
+    def compute_feature_diversity(self, activations):
+        coherence, diversity, _ = self.compute_feature_statistics(activations)
+        return diversity
+
+    def validate_representation(self, activations):
+        coherence, diversity, stability = self.compute_feature_statistics(activations)
+
+        threshold = torch.mean(activations) * 0.1
+        sparsity = torch.mean((activations < threshold).float())
+
+        return {
+            'sparsity': sparsity.item(),
+            'coherence': coherence,
+            'stability': stability,
+            'diversity': diversity
+        }
+
     def forward(self, x):
-        activations = self.activation(self.encoder(x))
-        return self.decoder(activations), activations
+        # Initial normalisation
+        x_centred = x - x.mean(dim=1, keepdim=True)
+        x_scaled = x_centred / (x_centred.std(dim=1, keepdim=True) + self.eps)
+
+        # Encoder pass
+        encoded = self.encoder(x_scaled)
+
+        # Activation with dynamic threshold during training
+        if self.training:
+            threshold = torch.mean(torch.abs(encoded)) * 0.1
+            activations = torch.relu(encoded - threshold) + torch.relu(-encoded - threshold)
+
+            if activations.abs().mean() < self.eps:
+                activations = activations + torch.randn_like(activations) * 0.01
+        else:
+            activations = self.activation(encoded)
+
+        # Decoder pass with scale recovery
+        decoded = self.decoder(activations)
+        output = decoded * x_centred.std(dim=1, keepdim=True) + x.mean(dim=1, keepdim=True)
+
+        return output, activations
 
 
 class AdaptiveCurriculumTrainer:
@@ -158,13 +224,13 @@ class AdaptiveCurriculumTrainer:
         new_diff = self.beta * self.difficulty_history[-1] + (1 - self.beta) * loss
         self.difficulty_history.append(new_diff)
         return (new_diff - min(self.difficulty_history)) / (
-                    max(self.difficulty_history) - min(self.difficulty_history) + 1e-6)
+                max(self.difficulty_history) - min(self.difficulty_history) + 1e-6)
 
     def train_layer(self, layer_idx, train_data, val_data, epochs=100, batch_size=32):
         sae = self.saes[layer_idx]
-        self.optimizer = optim.AdamW(sae.parameters(), lr=1e-3, weight_decay=0.01)
+        self.optimizer = optim.AdamW(sae.parameters(), lr=5e-4, weight_decay=1e-5)  # Reduced learning rate
         self.scaler = GradScaler()
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=3)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5)
 
         for epoch in range(epochs):
             sae.train()
@@ -180,21 +246,22 @@ class AdaptiveCurriculumTrainer:
                     hidden_states = hidden_states.view(-1, self.hidden_size).float()
 
                 self.optimizer.zero_grad()
-                with autocast():
+                with torch.amp.autocast('cuda'):  # Fixed deprecated warning
                     recon, activations = sae(hidden_states)
                     recon_loss = nn.MSELoss()(recon, hidden_states)
-                    sparsity = (activations == 0).float().mean()
+                    sparsity = (activations.abs() < 0.01).float().mean()  # Modified sparsity threshold
                     sparsity_penalty = sae.sparsity_controller.compute_penalty(sparsity.item())
                     frame_potential = sae.encoder.compute_frame_potential()
                     diversity_loss = sae.compute_feature_diversity(activations)
                     ortho_loss = sae.decoder.compute_frame_potential()
 
-                    loss = recon_loss + sparsity_penalty * frame_potential + \
-                           sae.diversity_weight * diversity_loss + 0.1 * ortho_loss
+                    # Balanced loss terms
+                    loss = recon_loss + 0.1 * sparsity_penalty * frame_potential + \
+                           0.01 * diversity_loss + 0.01 * ortho_loss
 
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(sae.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(sae.parameters(), 0.5)  # Reduced gradient clipping
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 sae.encoder.project_to_stiefel()
@@ -222,26 +289,44 @@ class AdaptiveCurriculumTrainer:
                 hidden_states = hidden_states.view(-1, self.hidden_size).float()
                 recon, activations = sae(hidden_states)
 
+                # Compute primary metrics
                 recon_loss = nn.MSELoss()(recon, hidden_states)
-                sparsity = (activations == 0).float().mean()
+                sparsity = (activations.abs() < 0.01).float().mean()
                 frame_potential = sae.encoder.compute_frame_potential()
-                diversity = sae.compute_feature_diversity(activations)
-                ortho_loss = sae.decoder.compute_frame_potential()
-                stability = torch.std(activations, dim=0).mean()
+
+                # Get feature statistics
+                coherence, diversity, stability = sae.compute_feature_statistics(activations)
+
+                # Compute semantic consistency
                 semantic = sae.track_semantic_consistency(activations, 'val')
 
+                # Compute orthogonality loss
+                ortho_loss = sae.decoder.compute_frame_potential()
+
+                # Ensure all values are Python floats before creating FeatureMetrics
                 metrics = FeatureMetrics(
-                    sparsity.item(), frame_potential.item(), stability.item(),
-                    diversity.item(), semantic, recon_loss.item(), ortho_loss.item()
+                    sparsity=float(sparsity.item()),
+                    coherence=float(coherence),
+                    stability=float(stability),
+                    diversity=float(diversity),
+                    semantic_consistency=float(semantic),
+                    recon_error=float(recon_loss.item()),
+                    ortho_loss=float(ortho_loss.item())
                 )
 
+                # Accumulate metrics
                 for field in FeatureMetrics.__dataclass_fields__:
-                    setattr(total_metrics, field, getattr(total_metrics, field) + getattr(metrics, field))
+                    current_value = getattr(total_metrics, field)
+                    new_value = getattr(metrics, field)
+                    setattr(total_metrics, field, current_value + new_value)
 
+        # Average the accumulated metrics
+        batch_count = len(val_data)
         for field in FeatureMetrics.__dataclass_fields__:
-            setattr(total_metrics, field, getattr(total_metrics, field) / len(val_data))
+            current_value = getattr(total_metrics, field)
+            setattr(total_metrics, field, current_value / batch_count)
 
-        return total_metrics
+    return total_metrics
 
     def log_metrics(self, layer_idx, epoch, train_loss, val_metrics):
         log_data = {
