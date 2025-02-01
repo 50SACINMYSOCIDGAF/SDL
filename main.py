@@ -24,29 +24,47 @@ class FeatureMetrics:
 
 
 class AdaptiveSparsityController:
-    def __init__(self, target_sparsity=0.1, adaptation_rate=0.01, tolerance=0.05):
+    def __init__(self, target_sparsity=0.2, adaptation_rate=0.05, tolerance=0.1):
         self.target_sparsity = target_sparsity
         self.adaptation_rate = adaptation_rate
         self.tolerance = tolerance
         self.history = []
+        self.moving_avg = None
+        self.beta = 0.9
 
     def compute_penalty(self, current_sparsity):
-        error = self.target_sparsity - current_sparsity
+        # Update moving average for stability
+        if self.moving_avg is None:
+            self.moving_avg = current_sparsity
+        else:
+            self.moving_avg = self.beta * self.moving_avg + (1 - self.beta) * current_sparsity
+
+        # Compute error with respect to moving average
+        error = self.target_sparsity - self.moving_avg
         self.history.append(error)
-        return torch.exp(torch.tensor(error / self.tolerance)) if error > 0 else torch.log1p(
-            torch.tensor(abs(error) / self.tolerance))
+
+        # Asymmetric penalty function
+        if error > 0:
+            return torch.exp(torch.tensor(error / self.tolerance))
+        else:
+            return 0.5 * torch.log1p(torch.tensor(abs(error) / self.tolerance))
 
     def update_target(self, epoch, total_epochs):
+        # Progressive sparsity schedule
         progress = epoch / total_epochs
-        self.target_sparsity = 0.05 + 0.15 * (1 - np.exp(-3 * progress))
+        base_sparsity = 0.2
+        max_sparsity = 0.5
+        self.target_sparsity = base_sparsity + (max_sparsity - base_sparsity) * \
+                               (1 - np.exp(-5 * progress))
 
 
 class StiefelGrassmannianDictionary(nn.Module):
-    def __init__(self, input_dim, dict_size, tau=0.01):
+    def __init__(self, input_dim, dict_size, eps=1e-6, tau=0.01):
         super().__init__()
         self.input_dim = input_dim
         self.dict_size = dict_size
         self.tau = tau
+        self.eps = eps
         self.dictionary = orthogonal(nn.Linear(input_dim, dict_size, bias=False))
         self.initialise_stiefel()
 
@@ -70,51 +88,71 @@ class StiefelGrassmannianDictionary(nn.Module):
     def compute_frame_potential(self):
         W = self.dictionary.weight
         gram = W @ W.t() if self.input_dim >= self.dict_size else W.t() @ W
-        return torch.norm(gram - torch.eye(gram.size(0), device=gram.device)) ** 2
+        identity = torch.eye(gram.size(0), device=gram.device)
+        return torch.norm(gram - identity) ** 2
 
     def forward(self, x):
         return self.dictionary(x)
 
 
-class EnhancedSparseAutoencoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, coherence_penalty=0.1, diversity_weight=0.1):
+class SparseAutoencoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, coherence_penalty=0.1, diversity_weight=0.1, eps=1e-6):
         super().__init__()
-        self.encoder = StiefelGrassmannianDictionary(input_dim, hidden_dim)
-        self.decoder = StiefelGrassmannianDictionary(hidden_dim, input_dim)
+        self.eps = eps
+        self.encoder = StiefelGrassmannianDictionary(input_dim, hidden_dim, eps=self.eps)
+        self.decoder = StiefelGrassmannianDictionary(hidden_dim, input_dim, eps=self.eps)
         self.activation = nn.ReLU()
         self.coherence_penalty = coherence_penalty
         self.diversity_weight = diversity_weight
         self.sparsity_controller = AdaptiveSparsityController()
         self.feature_history = []
         self.semantic_cache = {}
-        self.eps = 1e-6
+        # New attributes for stability tracking
+        self.feature_ema = None
+        self.ema_decay = 0.99
 
     def compute_feature_statistics(self, activations):
         with torch.autocast(device_type='cuda', enabled=False):
             act = activations.float()
+            batch_size = act.size(0)
+
+            # Normalisation with improved numerical stability
             act_norm = act / (torch.norm(act, dim=1, keepdim=True) + self.eps)
 
-            # Compute coherence
+            # Coherence computation
             gram = torch.mm(act_norm, act_norm.t())
-            off_diag = torch.triu(gram, diagonal=1)
-            coherence = torch.mean(torch.abs(off_diag))
+            mask = torch.triu(torch.ones_like(gram), diagonal=1).bool()
+            coherence = torch.abs(gram[mask]).mean()
 
-            # Compute diversity
-            _, s, _ = torch.svd(act, compute_uv=False)
-            s_norm = s / (torch.sum(s) + self.eps)
-            diversity = 1 - torch.sum(s_norm * s_norm)
+            # Enhanced diversity computation using eigenvalue dispersion
+            cov_matrix = (act.T @ act) / (batch_size - 1)
+            eigenvals = torch.linalg.eigvalsh(cov_matrix + self.eps * torch.eye(cov_matrix.size(0),
+                                                                                device=cov_matrix.device))
+            normalised_eigenvals = eigenvals / (torch.sum(eigenvals) + self.eps)
+            diversity = 1.0 - (torch.max(normalised_eigenvals) - torch.min(normalised_eigenvals)) / \
+                        (1.0 + torch.std(normalised_eigenvals))
 
-            # Compute stability
-            mean_act = torch.mean(act, dim=0)
-            std_act = torch.std(act, dim=0)
-            stability = torch.mean(mean_act / (std_act + self.eps))
+            # Stability computation with EMA
+            if self.feature_ema is None:
+                self.feature_ema = act.mean(dim=0)
+            else:
+                current_mean = act.mean(dim=0)
+                self.feature_ema = self.ema_decay * self.feature_ema + \
+                                   (1 - self.ema_decay) * current_mean
 
-            # Normalise metrics
+            mean_deviation = torch.norm(act.mean(dim=0) - self.feature_ema)
+            stability = torch.exp(-mean_deviation / self.eps)
+
+            # Ensure metrics are properly bounded
             coherence = torch.clamp(coherence, 0, 1)
             diversity = torch.clamp(diversity, 0, 1)
-            stability = torch.sigmoid(stability)
+            stability = torch.clamp(stability, 0, 1)
 
             return coherence.item(), diversity.item(), stability.item()
+
+    def compute_feature_diversity(self, activations):
+        coherence, diversity, _ = self.compute_feature_statistics(activations)
+        return diversity
 
     def track_semantic_consistency(self, activations, batch_id):
         with torch.autocast(device_type='cuda', enabled=False):
@@ -135,44 +173,40 @@ class EnhancedSparseAutoencoder(nn.Module):
             self.semantic_cache[batch_id] = act.detach()
             return 1.0
 
-    def compute_feature_diversity(self, activations):
-        coherence, diversity, _ = self.compute_feature_statistics(activations)
-        return diversity
-
-    def validate_representation(self, activations):
-        coherence, diversity, stability = self.compute_feature_statistics(activations)
-
-        threshold = torch.mean(activations) * 0.1
-        sparsity = torch.mean((activations < threshold).float())
-
-        return {
-            'sparsity': sparsity.item(),
-            'coherence': coherence,
-            'stability': stability,
-            'diversity': diversity
-        }
-
     def forward(self, x):
-        # Initial normalisation
-        x_centred = x - x.mean(dim=1, keepdim=True)
-        x_scaled = x_centred / (x_centred.std(dim=1, keepdim=True) + self.eps)
+        x = x.to(torch.float32)
 
-        # Encoder pass
+        # Input normalisation with improved numerical stability
+        x_centred = x - x.mean(dim=1, keepdim=True)
+        x_scaled = x_centred / (torch.norm(x_centred, dim=1, keepdim=True) + self.eps)
+
+        # Encoder pass with gradient scaling
         encoded = self.encoder(x_scaled)
 
-        # Activation with dynamic threshold during training
+        # Unified sparsity mechanism
+        abs_encoded = torch.abs(encoded).float()
+        threshold = torch.quantile(abs_encoded, 0.8, dim=1, keepdim=True)
+        threshold = threshold.detach()
+
         if self.training:
-            threshold = torch.mean(torch.abs(encoded)) * 0.1
-            activations = torch.relu(encoded - threshold) + torch.relu(-encoded - threshold)
+            # Soft thresholding with temperature scaling
+            temp = 0.1
+            soft_threshold = torch.sigmoid((abs_encoded - threshold) / temp)
+            activations = encoded * soft_threshold
 
+            # Add minimal noise to prevent dead features
             if activations.abs().mean() < self.eps:
-                activations = activations + torch.randn_like(activations) * 0.01
+                noise_scale = 0.01 * threshold.mean()
+                activations = activations + torch.randn_like(activations) * noise_scale
         else:
-            activations = self.activation(encoded)
+            # Hard thresholding for inference
+            activations = encoded * (abs_encoded > threshold).float()
 
-        # Decoder pass with scale recovery
+        # Decoder pass with normalisation preservation
         decoded = self.decoder(activations)
-        output = decoded * x_centred.std(dim=1, keepdim=True) + x.mean(dim=1, keepdim=True)
+
+        # Scale recovery with proper statistics preservation
+        output = decoded * torch.norm(x_centred, dim=1, keepdim=True) + x.mean(dim=1, keepdim=True)
 
         return output, activations
 
@@ -183,7 +217,7 @@ class AdaptiveCurriculumTrainer:
         self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.hidden_size = self.model.config.hidden_size
-        self.saes = nn.ModuleList([EnhancedSparseAutoencoder(self.hidden_size, hid_dim).to(device)
+        self.saes = nn.ModuleList([SparseAutoencoder(self.hidden_size, hid_dim).to(device)
                                    for layer_idx, hid_dim in enumerate(dim[1] for dim in layer_dims)])
         self.beta = beta
         self.difficulty_history = []
@@ -228,9 +262,18 @@ class AdaptiveCurriculumTrainer:
 
     def train_layer(self, layer_idx, train_data, val_data, epochs=100, batch_size=32):
         sae = self.saes[layer_idx]
-        self.optimizer = optim.AdamW(sae.parameters(), lr=5e-4, weight_decay=1e-5)  # Reduced learning rate
+        self.optimizer = optim.AdamW(sae.parameters(), lr=5e-4, weight_decay=1e-5)
         self.scaler = GradScaler()
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5)
+
+        # Define loss scaling factors
+        loss_scales = {
+            'reconstruction': 1.0,
+            'sparsity': 0.1,
+            'diversity': 0.05,
+            'stability': 0.025,
+            'orthogonality': 0.01
+        }
 
         for epoch in range(epochs):
             sae.train()
@@ -246,29 +289,42 @@ class AdaptiveCurriculumTrainer:
                     hidden_states = hidden_states.view(-1, self.hidden_size).float()
 
                 self.optimizer.zero_grad()
-                with torch.amp.autocast('cuda'):  # Fixed deprecated warning
+                with torch.amp.autocast('cuda'):
                     recon, activations = sae(hidden_states)
+
+                    # Compute all loss components
                     recon_loss = nn.MSELoss()(recon, hidden_states)
-                    sparsity = (activations.abs() < 0.01).float().mean()  # Modified sparsity threshold
+                    sparsity = (activations.abs() < 0.01).float().mean()
                     sparsity_penalty = sae.sparsity_controller.compute_penalty(sparsity.item())
                     frame_potential = sae.encoder.compute_frame_potential()
-                    diversity_loss = sae.compute_feature_diversity(activations)
+                    coherence, diversity, stability = sae.compute_feature_statistics(activations)
                     ortho_loss = sae.decoder.compute_frame_potential()
 
-                    # Balanced loss terms
-                    loss = recon_loss + 0.1 * sparsity_penalty * frame_potential + \
-                           0.01 * diversity_loss + 0.01 * ortho_loss
+                    # Combine losses with scaling factors
+                    loss = loss_scales['reconstruction'] * recon_loss + \
+                           loss_scales['sparsity'] * sparsity_penalty * frame_potential + \
+                           loss_scales['diversity'] * (1 - diversity) + \
+                           loss_scales['stability'] * (1 - stability) + \
+                           loss_scales['orthogonality'] * ortho_loss
 
+                # Gradient scaling and clipping
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(sae.parameters(), 0.5)  # Reduced gradient clipping
+                nn.utils.clip_grad_norm_(sae.parameters(), 0.5)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                # Project weights onto Stiefel manifold
                 sae.encoder.project_to_stiefel()
                 sae.decoder.project_to_stiefel()
 
                 epoch_loss += loss.item()
-                progress.set_postfix({'loss': loss.item(), 'sparsity': sparsity.item()})
+                progress.set_postfix({
+                    'loss': loss.item(),
+                    'sparsity': sparsity.item(),
+                    'diversity': diversity,
+                    'stability': stability
+                })
 
             avg_loss = epoch_loss / len(train_data)
             scheduler.step(avg_loss)
@@ -326,7 +382,7 @@ class AdaptiveCurriculumTrainer:
             current_value = getattr(total_metrics, field)
             setattr(total_metrics, field, current_value / batch_count)
 
-    return total_metrics
+        return total_metrics
 
     def log_metrics(self, layer_idx, epoch, train_loss, val_metrics):
         log_data = {
@@ -352,6 +408,9 @@ if __name__ == "__main__":
         layer_dims=[(None, 2048), (None, 4096)],
         device=device
     )
+
+    print("Model config:", trainer.model.config)  # Access through trainer instance
+    print("Hidden size:", trainer.model.config.hidden_size)
 
     train_data = [torch.randint(0, 10000, (32, 512)).to(device) for _ in range(100)]
     val_data = [torch.randint(0, 10000, (16, 512)).to(device) for _ in range(20)]
