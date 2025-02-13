@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from click.core import F
+from transformers import AutoTokenizer, AutoModelForCausalLM, activations
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.signal import correlate
-import pandas as pd
 from typing import List, Dict
 from dataclasses import dataclass
 import plotly.graph_objects as go
@@ -121,26 +121,20 @@ class MemoryEfficientSDLAnalyzer:
             if key in checkpoint_state:
                 new_state[key] = checkpoint_state[key]
             elif "parametrizations.weight.original" in key:
-                # Map from "<prefix>.weight" in checkpoint to parametrized key.
                 base_key = key.replace("parametrizations.weight.original", "weight")
                 if base_key in checkpoint_state:
                     new_state[key] = checkpoint_state[base_key]
                 else:
                     print(f"Warning: missing key for {key} (tried {base_key})")
             elif "parametrizations.weight.0.base" in key:
-                # For the base parameter, compute a QR decomposition from the pretrained weight.
                 base_key = key.replace("parametrizations.weight.0.base", "weight")
                 if base_key in checkpoint_state:
                     pretrained_weight = checkpoint_state[base_key]
-                    # For a linear layer weight of shape [out_features, in_features],
-                    # compute QR on the transpose so that: weight^T = Q * R.
-                    # We then use R^T as the "base" parameter.
                     Q, R = torch.linalg.qr(pretrained_weight.T)
                     new_state[key] = R.T
                 else:
                     print(f"Warning: missing key for {key} (tried {base_key})")
             else:
-                # For any extra keys, ignore (or assign the default model value).
                 new_state[key] = model_state[key]
         load_result = self.sdl.load_state_dict(new_state, strict=False)
         print("SDL checkpoint load result:")
@@ -148,15 +142,12 @@ class MemoryEfficientSDLAnalyzer:
         print("  Unexpected keys:", load_result.unexpected_keys)
 
     def process_text(self, text: str, max_length: int = 512) -> torch.Tensor:
-        # Tokenize text with truncation.
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         with torch.no_grad(), self.autocast_context:
             output = self.model(**inputs, output_hidden_states=True)
-            # Use the second hidden state (index 1); flatten batch dims.
             hidden_states = output.hidden_states[1]
             hidden_states = hidden_states.view(-1, hidden_states.size(-1))
-            # Process hidden states in batches to conserve memory.
             batch_size = 32
             activation_batches = []
             for i in range(0, hidden_states.size(0), batch_size):
@@ -184,7 +175,7 @@ class EnhancedSDLVisualizer:
     def __init__(self, analyzer: MemoryEfficientSDLAnalyzer):
         self.analyzer = analyzer
         self.color_palette = sns.color_palette("husl", 10)
-        # Try using the updated seaborn darkgrid style; if unavailable, fall back to the default seaborn-v0_8 style.
+        # Use the updated seaborn style name.
         try:
             plt.style.use("seaborn-v0_8-darkgrid")
         except OSError:
@@ -298,7 +289,80 @@ class EnhancedSDLVisualizer:
                         "activation": activation,
                         "position": i
                     })
-        return pd.DataFrame(contexts)
+        return contexts  # returning list of dictionaries instead of a DataFrame
+
+    def analyze_cot_patterns(self, text: str) -> Dict:
+        activations = self.analyzer.process_text(text)
+        tokens = self.analyzer.tokenizer.encode(text)
+        token_texts = self.analyzer.tokenizer.convert_ids_to_tokens(tokens)
+
+        steps = [s.strip() for s in text.split('\n') if s.strip().startswith(('1.', '2.', '3.', '4.'))]
+        step_patterns = []
+        current_step = []
+        step_idx = 0
+
+        for i, token in enumerate(token_texts):
+            if i < len(activations):
+                if any(step.split()[0] in token for step in steps):
+                    if current_step:
+                        step_patterns.append({
+                            'step': step_idx,
+                            'activations': torch.stack(current_step),
+                            'tokens': token_texts[i - len(current_step):i]
+                        })
+                    current_step = []
+                    step_idx += 1
+                current_step.append(activations[i])
+
+        atom_patterns = self.find_solution_markers(activations)
+        return {'steps': step_patterns, 'atoms': atom_patterns}
+
+    def find_solution_markers(self, activations: torch.Tensor) -> List[Dict]:
+        threshold = 0.8
+        high_activations = (activations > torch.quantile(activations, threshold, dim=0))
+        patterns = []
+
+        for i in range(activations.size(1)):
+            atom_activations = high_activations[:, i]
+            if atom_activations.any():
+                points = atom_activations.nonzero().squeeze()
+                if len(points.shape) > 0 and points.shape[0] > 1:
+                    gaps = points[1:] - points[:-1]
+                    if gaps.shape[0] > 0:
+                        regularity = float(torch.std(gaps.float()) / (torch.mean(gaps.float()) + 1e-6))
+                        patterns.append({
+                            'atom': i,
+                            'timing': points.tolist(),
+                            'avg_gap': float(torch.mean(gaps.float())),
+                            'regularity': regularity
+                        })
+        return patterns
+
+    def plot_cot_analysis(self, atom_patterns: List[Dict], step_patterns: List[Dict]):
+        fig = make_subplots(rows=2, cols=1, subplot_titles=('Atom Activation Patterns', 'Step Analysis'))
+
+        for pattern in atom_patterns:
+            fig.add_trace(
+                go.Scatter(
+                    x=pattern['timing'],
+                    y=[pattern['atom']] * len(pattern['timing']),
+                    mode='markers',
+                    name=f'Atom {pattern["atom"]}'
+                ),
+                row=1, col=1
+            )
+
+        for step in step_patterns:
+            fig.add_trace(
+                go.Heatmap(
+                    z=step['activations'].mean(dim=0).unsqueeze(0),
+                    name=f'Step {step["step"]}'
+                ),
+                row=2, col=1
+            )
+
+        fig.update_layout(height=800, title_text='Chain of Thought Analysis')
+        return fig
 
 
 # ---------------------------
@@ -311,7 +375,6 @@ def main():
 
     analyzer = MemoryEfficientSDLAnalyzer()
     visualizer = EnhancedSDLVisualizer(analyzer)
-
     mmlu = load_dataset("cais/mmlu", "all")
 
     subject_groups = {
@@ -323,22 +386,15 @@ def main():
 
     results = {}
 
-    for group_name, subjects in subject_groups.items():
-        print(f"\nAnalyzing {group_name} subjects...")
-
+    for domain, subjects in subject_groups.items():
+        chosen_text = None
+        chosen_subject = None
         for subject in subjects:
             subject_data = mmlu["test"].filter(lambda x: x["subject"] == subject)
-
-            if len(subject_data) == 0:
-                continue
-
-            # Sample up to 5 random questions from the subject.
-            sample_indices = random.sample(range(len(subject_data)), min(5, len(subject_data)))
-
-            for idx in sample_indices:
+            if len(subject_data) > 0:
+                idx = random.randint(0, len(subject_data) - 1)
                 question = subject_data[idx]
-                # Format the text as a reasoning problem.
-                text = (
+                chosen_text = (
                     f"Question: {question['question']}\n\n"
                     "Let's solve this step by step:\n"
                     "1. First, let's understand what we're being asked.\n"
@@ -350,60 +406,54 @@ def main():
                     "3. Let's think through each option carefully.\n"
                     "4. Finally, we can determine the correct answer."
                 )
+                chosen_subject = subject
+                break
 
-                print(f"\nAnalyzing {subject} question {idx + 1}...")
+        if chosen_text is not None:
+            print(f"\nAnalyzing domain '{domain}' using subject '{chosen_subject}'...")
 
-                # Generate and save visualizations.
-                fig_activation = visualizer.plot_activation_comparison([0, 4], text)
-                fig_activation.write_html(f"activation_{group_name}_{subject}_{idx}.html")
+            # Basic analysis
+            fig_activation = visualizer.plot_activation_comparison([0, 4], chosen_text)
+            fig_activation.write_html(f"activation_{domain}_{chosen_subject}.html")
+            fig_phase = visualizer.plot_phase_space(0, 4, chosen_text)
+            fig_phase.write_html(f"phase_{domain}_{chosen_subject}.html")
+            token_contexts = visualizer.analyze_token_contexts([0, 4], chosen_text)
+            analysis = visualizer.analyze_atom_pair(0, 4, chosen_text)
 
-                fig_phase = visualizer.plot_phase_space(0, 4, text)
-                fig_phase.write_html(f"phase_{group_name}_{subject}_{idx}.html")
+            # Get base results
+            results[domain] = {
+                "correlation_peak": analysis.temporal_correlations.max().item(),
+                "avg_phase_diff": analysis.phase_relationships.mean().item(),
+                "max_activation": analysis.activation_patterns.max().item(),
+                "correct_answer": question["answer"],
+                "context_activations": token_contexts
+            }
 
-                # Analyze token contexts and save to CSV.
-                contexts_df = visualizer.analyze_token_contexts([0, 4], text)
-                contexts_df.to_csv(f"contexts_{group_name}_{subject}_{idx}.csv", index=False)
+            # Add CoT analysis
+            cot_results = visualizer.analyze_cot_patterns(chosen_text)
+            activations = visualizer.analyzer.process_text(chosen_text)
+            solution_markers = visualizer.find_solution_markers(activations)
 
-                # Get atom pair analysis.
-                analysis = visualizer.analyze_atom_pair(0, 4, text)
+            results[domain].update({
+                'reasoning_steps': len(cot_results['steps']),
+                'solution_markers': len(solution_markers),
+                'regular_patterns': [p for p in solution_markers if p['regularity'] < 0.2]
+            })
 
-                # Store results.
-                if subject not in results:
-                    results[subject] = []
+            # Plot CoT analysis
+            cot_fig = visualizer.plot_cot_analysis(cot_results['atoms'], cot_results['steps'])
+            cot_fig.write_html(f"cot_analysis_{domain}_{chosen_subject}.html")
+        else:
+            print(f"No data found for domain '{domain}'.")
 
-                results[subject].append({
-                    "question_idx": idx,
-                    "correlation_peak": analysis.temporal_correlations.max().item(),
-                    "avg_phase_diff": analysis.phase_relationships.mean().item(),
-                    "max_activation": analysis.activation_patterns.max().item(),
-                    "correct_answer": question["answer"],
-                    "context_activations": contexts_df.to_dict("records")
-                })
-
-                # Save token associations.
-                pd.DataFrame(
-                    list(analysis.token_associations.items()),
-                    columns=["token", "activation"]
-                ).to_csv(f"tokens_{group_name}_{subject}_{idx}.csv", index=False)
-
-    # Save aggregate results.
-    aggregate_results = {
-        subject: {
-            "avg_correlation": np.mean([r["correlation_peak"] for r in subject_results]),
-            "avg_phase_diff": np.mean([r["avg_phase_diff"] for r in subject_results]),
-            "max_activation": max([r["max_activation"] for r in subject_results]),
-            "num_samples": len(subject_results)
-        }
-        for subject, subject_results in results.items()
-    }
-    pd.DataFrame(aggregate_results).T.to_csv("aggregate_results.csv", index=True)
-
-    # Print summary.
     print("\nAnalysis Complete! Summary of findings:")
-    for subject, metrics in aggregate_results.items():
-        print(f"\n{subject}:")
+    for domain, metrics in results.items():
+        print(f"\n{domain}:")
         for metric, value in metrics.items():
-            print(f"  {metric}: {value:.4f}")
+            if isinstance(value, float):
+                print(f"  {metric}: {value:.4f}")
+            else:
+                print(f"  {metric}: {value}")
 
 
 if __name__ == "__main__":
