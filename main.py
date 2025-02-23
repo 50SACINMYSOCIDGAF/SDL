@@ -29,16 +29,17 @@ class FeatureMetrics:
     recon_error: float
     ortho_loss: float
 
+
 class AdaptiveSparsityController:
-    def __init__(self, target_sparsity: float = 0.2, adaptation_rate: float = 0.05, tolerance: float = 0.1):
+    def __init__(self, target_sparsity: float = 0.2, adaptation_rate: float = 0.05):
         self.target_sparsity = target_sparsity
         self.adaptation_rate = adaptation_rate
-        self.tolerance = tolerance
-        self.history = []
         self.moving_avg = None
         self.beta = 0.9
         self.min_penalty = 0.01
-        self.max_penalty = 10.0
+        self.max_penalty = 5.0
+        self.history = []
+
     def compute_penalty(self, current_sparsity: float) -> torch.Tensor:
         if self.moving_avg is None:
             self.moving_avg = current_sparsity
@@ -46,15 +47,14 @@ class AdaptiveSparsityController:
             self.moving_avg = self.beta * self.moving_avg + (1 - self.beta) * current_sparsity
         error = self.target_sparsity - self.moving_avg
         self.history.append(error)
-        if error > 0:
-            penalty = torch.exp(torch.tensor(error / self.tolerance))
-        else:
-            penalty = 0.5 * torch.log1p(torch.tensor(abs(error) / self.tolerance))
-        return torch.clamp(penalty, self.min_penalty, self.max_penalty)
+        penalty = torch.tanh(torch.tensor(error * 5))
+        return torch.clamp(self.min_penalty + (self.max_penalty - self.min_penalty) * (penalty + 1) / 2,
+                           self.min_penalty, self.max_penalty)
+
     def update_target(self, epoch: int, total_epochs: int) -> None:
         progress = epoch / total_epochs
         base_sparsity = 0.15
-        max_sparsity = 0.4
+        max_sparsity = 0.35
         cos_val = 0.5 * (1 + np.cos(progress * np.pi))
         self.target_sparsity = base_sparsity + (max_sparsity - base_sparsity) * (1 - cos_val)
 
@@ -95,7 +95,8 @@ class StiefelGrassmannianDictionary(nn.Module):
         return self.dictionary(x)
 
 class SparseAutoencoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, coherence_penalty: float = 0.1, diversity_weight: float = 0.1, eps: float = 1e-6):
+    def __init__(self, input_dim: int, hidden_dim: int, coherence_penalty: float = 0.1, diversity_weight: float = 0.1,
+                 eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.encoder = StiefelGrassmannianDictionary(input_dim, hidden_dim, eps=self.eps)
@@ -107,18 +108,36 @@ class SparseAutoencoder(nn.Module):
         self.semantic_cache = {}
         self.feature_ema = None
         self.ema_decay = 0.99
+        self.buffer_size = 10000
+        self.training_buffer = None
+        self.buffer_filled = False
+    def update_training_buffer(self, x: torch.Tensor):
+        if not self.buffer_filled:
+            if self.training_buffer is None:
+                self.training_buffer = x.detach().clone()
+            else:
+                self.training_buffer = torch.cat([self.training_buffer, x.detach()], dim=0)
+                if self.training_buffer.size(0) >= self.buffer_size:
+                    self.buffer_filled = True
+                    self.initialize_pca()
     def reinitialize_unstable_features(self, activations: torch.Tensor, stability_threshold: float = 0.2):
         with torch.no_grad():
-            feature_stabilities = []
+            act_norm = activations / (torch.norm(activations, dim=1, keepdim=True) + self.eps)
+            feature_corr = torch.mm(act_norm.T, act_norm)
+            corr_mask = (feature_corr > 0.9) & (feature_corr < 1.0)
             for i in range(activations.size(1)):
                 if self.feature_ema is not None:
                     feat_ema = self.feature_ema[i]
                     feat_current = activations[:, i].mean()
                     relative_change = abs(feat_current - feat_ema) / (abs(feat_ema) + self.eps)
                     stability = 1.0 / (1.0 + relative_change)
-                    feature_stabilities.append(stability)
-                    if stability < stability_threshold:
+                    has_correlations = corr_mask[i].any()
+                    if stability < stability_threshold or has_correlations:
                         rand_vec = torch.randn(self.encoder.input_dim, device=activations.device)
+                        for j in range(i):
+                            if j != i:
+                                proj = torch.dot(rand_vec, self.encoder.dictionary.weight.data[j])
+                                rand_vec -= proj * self.encoder.dictionary.weight.data[j]
                         rand_vec = rand_vec / torch.norm(rand_vec)
                         self.encoder.dictionary.weight.data[i] = rand_vec
                         if i < self.decoder.input_dim:
@@ -131,26 +150,18 @@ class SparseAutoencoder(nn.Module):
             act_norm = act / (torch.norm(act, dim=1, keepdim=True) + self.eps)
             gram = torch.mm(act_norm, act_norm.t())
             mask = torch.triu(torch.ones_like(gram), diagonal=1).bool()
-            coherence = torch.abs(gram[mask]).mean()
+            coherence_mean = torch.abs(gram[mask]).mean()
+            coherence_max = torch.abs(gram[mask]).max()
             cov_matrix = (act.T @ act) / (batch_size - 1)
             eye = torch.eye(cov_matrix.size(0), device=cov_matrix.device)
             eigenvals = torch.linalg.eigvalsh(cov_matrix + self.eps * eye)
             normalized_eigenvals = eigenvals / (torch.sum(eigenvals) + self.eps)
             diversity = 1.0 - torch.max(normalized_eigenvals) / (torch.sum(normalized_eigenvals) + self.eps)
-            if self.feature_ema is None:
-                self.feature_ema = act.mean(dim=0)
-                stability = torch.tensor(1.0, device=act.device)
-            else:
-                current_mean = act.mean(dim=0)
-                delta = current_mean - self.feature_ema
-                relative_change = torch.norm(delta) / (torch.norm(self.feature_ema) + self.eps)
-                adaptive_rate = torch.clip(0.1 * torch.exp(-5 * relative_change), 0.001, 0.1)
-                self.feature_ema = (1 - adaptive_rate) * self.feature_ema + adaptive_rate * current_mean
-                stability = 1.0 / (1.0 + relative_change)
-            coherence = torch.clamp(coherence, 0, 1)
-            diversity = torch.clamp(diversity, 0, 1)
-            stability = torch.clamp(stability, 0.15, 1)
-            return coherence.item(), diversity.item(), stability.item()
+            singular_values = torch.linalg.svd(act, compute_uv=False).float()
+            effective_rank = (singular_values / singular_values[0]).sum()
+            sparsity = (act.abs() < 0.01).float().mean()
+            return sparsity.item(), coherence_mean.item(), coherence_max.item(), diversity.item(), (
+                        effective_rank / act.size(1)).item()
     def track_semantic_consistency(self, activations: torch.Tensor, batch_id: str):
         act_norm = activations / (torch.norm(activations, dim=1, keepdim=True) + self.eps)
         if batch_id in self.semantic_cache:
@@ -160,8 +171,21 @@ class SparseAutoencoder(nn.Module):
             return consistency.item()
         self.semantic_cache[batch_id] = act_norm.detach()
         return 1.0
+    def initialize_pca(self):
+        with torch.no_grad():
+            centered = self.training_buffer - self.training_buffer.mean(dim=0, keepdim=True)
+            cov = centered.T @ centered / (centered.size(0) - 1)
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+            sorted_indices = torch.argsort(eigenvalues, descending=True)
+            eigenvectors = eigenvectors[:, sorted_indices]
+            components = eigenvectors[:, :self.encoder.dict_size]
+            self.encoder.dictionary.weight.data = components.T
+            self.decoder.dictionary.weight.data = components
+            self.training_buffer = None
     def forward(self, x: torch.Tensor):
         x = x.to(torch.float32)
+        if self.training and not self.buffer_filled:
+            self.update_training_buffer(x)
         x_centered = x - x.mean(dim=1, keepdim=True)
         x_scaled = x_centered / (torch.norm(x_centered, dim=1, keepdim=True) + self.eps)
         encoded = self.encoder(x_scaled)
@@ -173,9 +197,11 @@ class SparseAutoencoder(nn.Module):
             soft_temp = torch.exp(-5 * feature_means).view(1, -1) * 0.1
             soft_threshold = torch.sigmoid((abs_encoded - threshold) / soft_temp)
             activations = encoded * soft_threshold
-            if activations.abs().mean() < self.eps:
+            noise_mask = activations.abs().mean(dim=1) < self.eps
+            if noise_mask.any():
                 noise_scale = 0.01 * threshold.mean()
-                activations = activations + torch.randn_like(activations) * noise_scale
+                noise = torch.randn_like(activations[noise_mask]) * noise_scale
+                activations[noise_mask] += noise
             self.reinitialize_unstable_features(activations)
         else:
             activations = encoded * (abs_encoded > torch.quantile(abs_encoded, 0.8, dim=1, keepdim=True)).float()
