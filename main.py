@@ -11,7 +11,6 @@ from torch.amp import autocast, GradScaler
 from torch.nn.utils.parametrizations import orthogonal
 from torch.linalg import svd, qr
 from tqdm import tqdm
-
 import wandb
 from transformers import AutoTokenizer, AutoModelForCausalLM
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -28,7 +27,6 @@ class FeatureMetrics:
     semantic_consistency: float
     recon_error: float
     ortho_loss: float
-
 
 class AdaptiveSparsityController:
     def __init__(self, target_sparsity: float = 0.2, adaptation_rate: float = 0.05):
@@ -48,8 +46,7 @@ class AdaptiveSparsityController:
         error = self.target_sparsity - self.moving_avg
         self.history.append(error)
         penalty = torch.tanh(torch.tensor(error * 5))
-        return torch.clamp(self.min_penalty + (self.max_penalty - self.min_penalty) * (penalty + 1) / 2,
-                           self.min_penalty, self.max_penalty)
+        return torch.clamp(self.min_penalty + (self.max_penalty - self.min_penalty) * (penalty + 1) / 2, self.min_penalty, self.max_penalty)
 
     def update_target(self, epoch: int, total_epochs: int) -> None:
         progress = epoch / total_epochs
@@ -67,6 +64,7 @@ class StiefelGrassmannianDictionary(nn.Module):
         self.eps = eps
         self.dictionary = orthogonal(nn.Linear(input_dim, dict_size, bias=False))
         self.initialize_stiefel()
+
     def initialize_stiefel(self) -> None:
         with torch.no_grad():
             if self.input_dim >= self.dict_size:
@@ -77,11 +75,13 @@ class StiefelGrassmannianDictionary(nn.Module):
                 rand_mat = torch.randn(self.dict_size, self.input_dim, device=self.dictionary.weight.device)
                 Q, _ = qr(rand_mat)
                 self.dictionary.weight.data = Q[:self.input_dim].t()
+
     def project_to_stiefel(self) -> None:
         with torch.no_grad():
             W = self.dictionary.weight
             U, _, Vh = svd(W.t(), full_matrices=False)
             self.dictionary.weight.data = Vh.t() @ U.t()
+
     def compute_frame_potential(self) -> torch.Tensor:
         W = self.dictionary.weight
         if self.input_dim >= self.dict_size:
@@ -91,12 +91,12 @@ class StiefelGrassmannianDictionary(nn.Module):
             gram = W.t() @ W
             identity = torch.eye(gram.size(0), device=gram.device)
         return torch.norm(gram - identity) ** 2
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.dictionary(x)
 
 class SparseAutoencoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, coherence_penalty: float = 0.1, diversity_weight: float = 0.1,
-                 eps: float = 1e-6):
+    def __init__(self, input_dim: int, hidden_dim: int, coherence_penalty: float = 0.1, diversity_weight: float = 0.1, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.encoder = StiefelGrassmannianDictionary(input_dim, hidden_dim, eps=self.eps)
@@ -111,15 +111,18 @@ class SparseAutoencoder(nn.Module):
         self.buffer_size = 10000
         self.training_buffer = None
         self.buffer_filled = False
+
     def update_training_buffer(self, x: torch.Tensor):
         if not self.buffer_filled:
+            x_float = x.detach().to(torch.float32)
             if self.training_buffer is None:
-                self.training_buffer = x.detach().clone()
+                self.training_buffer = x_float.clone()
             else:
-                self.training_buffer = torch.cat([self.training_buffer, x.detach()], dim=0)
+                self.training_buffer = torch.cat([self.training_buffer, x_float], dim=0)
                 if self.training_buffer.size(0) >= self.buffer_size:
                     self.buffer_filled = True
                     self.initialize_pca()
+
     def reinitialize_unstable_features(self, activations: torch.Tensor, stability_threshold: float = 0.2):
         with torch.no_grad():
             act_norm = activations / (torch.norm(activations, dim=1, keepdim=True) + self.eps)
@@ -142,26 +145,25 @@ class SparseAutoencoder(nn.Module):
                         self.encoder.dictionary.weight.data[i] = rand_vec
                         if i < self.decoder.input_dim:
                             self.decoder.dictionary.weight.data[:, i] = rand_vec
+
     def compute_feature_statistics(self, activations: torch.Tensor):
         device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
+        with autocast(device_type, enabled=False):
             act = activations.float()
             batch_size = act.size(0)
             act_norm = act / (torch.norm(act, dim=1, keepdim=True) + self.eps)
             gram = torch.mm(act_norm, act_norm.t())
             mask = torch.triu(torch.ones_like(gram), diagonal=1).bool()
             coherence_mean = torch.abs(gram[mask]).mean()
-            coherence_max = torch.abs(gram[mask]).max()
             cov_matrix = (act.T @ act) / (batch_size - 1)
             eye = torch.eye(cov_matrix.size(0), device=cov_matrix.device)
             eigenvals = torch.linalg.eigvalsh(cov_matrix + self.eps * eye)
             normalized_eigenvals = eigenvals / (torch.sum(eigenvals) + self.eps)
             diversity = 1.0 - torch.max(normalized_eigenvals) / (torch.sum(normalized_eigenvals) + self.eps)
-            singular_values = torch.linalg.svd(act, compute_uv=False).float()
+            singular_values = torch.linalg.svdvals(act).float()
             effective_rank = (singular_values / singular_values[0]).sum()
-            sparsity = (act.abs() < 0.01).float().mean()
-            return sparsity.item(), coherence_mean.item(), coherence_max.item(), diversity.item(), (
-                        effective_rank / act.size(1)).item()
+            return coherence_mean.item(), diversity.item(), (effective_rank / act.size(1)).item()
+
     def track_semantic_consistency(self, activations: torch.Tensor, batch_id: str):
         act_norm = activations / (torch.norm(activations, dim=1, keepdim=True) + self.eps)
         if batch_id in self.semantic_cache:
@@ -171,17 +173,22 @@ class SparseAutoencoder(nn.Module):
             return consistency.item()
         self.semantic_cache[batch_id] = act_norm.detach()
         return 1.0
+
     def initialize_pca(self):
         with torch.no_grad():
-            centered = self.training_buffer - self.training_buffer.mean(dim=0, keepdim=True)
+            device = self.training_buffer.device
+            buffer = self.training_buffer.cpu().float()
+            centered = buffer - buffer.mean(dim=0, keepdim=True)
             cov = centered.T @ centered / (centered.size(0) - 1)
             eigenvalues, eigenvectors = torch.linalg.eigh(cov)
             sorted_indices = torch.argsort(eigenvalues, descending=True)
             eigenvectors = eigenvectors[:, sorted_indices]
             components = eigenvectors[:, :self.encoder.dict_size]
-            self.encoder.dictionary.weight.data = components.T
-            self.decoder.dictionary.weight.data = components
+            orig_dtype = self.encoder.dictionary.weight.dtype
+            self.encoder.dictionary.weight.data = components.T.to(device=device, dtype=orig_dtype)
+            self.decoder.dictionary.weight.data = components.to(device=device, dtype=orig_dtype)
             self.training_buffer = None
+
     def forward(self, x: torch.Tensor):
         x = x.to(torch.float32)
         if self.training and not self.buffer_filled:
@@ -215,6 +222,7 @@ class DynamicLossScaler:
         self.history = {k: [] for k in initial_scales}
         self.ema_beta = 0.98
         self.scale_bounds = {"reconstruction": (0.5, 2.0), "sparsity": (0.05, 0.3), "diversity": (0.02, 0.15), "stability": (0.01, 0.1), "orthogonality": (0.005, 0.05)}
+
     def update_scales(self, metrics: Dict[str, float]) -> None:
         for key in self.scales:
             if key in metrics:
@@ -225,6 +233,7 @@ class DynamicLossScaler:
                     new_scale = self.scales[key] * scale_adjustment
                     min_bound, max_bound = self.scale_bounds[key]
                     self.scales[key] = max(min_bound, min(max_bound, new_scale))
+
     def get_scales(self) -> Dict[str, float]:
         return self.scales
 
@@ -247,9 +256,11 @@ class AdaptiveCurriculumTrainer:
         self.checkpoint_dir = "checkpoints"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         wandb.init(project="sdl_steifel", config={"layers": layer_dims, "model": model_path, "beta": beta})
+
     def save_checkpoint(self, layer_idx: int, epoch: int, optimizer, scaler) -> None:
         path = os.path.join(self.checkpoint_dir, f"layer_{layer_idx}_epoch_{epoch}.pt")
         torch.save({"model_state": self.saes[layer_idx].state_dict(), "optimizer_state": optimizer.state_dict(), "scaler_state": scaler.state_dict(), "metrics": self.best_metrics, "feature_ema": self.saes[layer_idx].feature_ema, "semantic_cache": self.saes[layer_idx].semantic_cache}, path)
+
     def train_layer(self, layer_idx: int, train_data, val_data, epochs: int = 50, batch_size: int = 64):
         sae = self.saes[layer_idx]
         optimizer = optim.AdamW(sae.parameters(), lr=1e-3, weight_decay=1e-5, betas=(0.9, 0.999))
@@ -266,10 +277,10 @@ class AdaptiveCurriculumTrainer:
             sae.sparsity_controller.update_target(epoch, epochs)
             for batch_idx, batch in enumerate(progress_bar):
                 x = batch.to(self.device, non_blocking=True)
-                with torch.no_grad(), torch.cuda.amp.autocast(dtype=dtype):
+                with torch.no_grad(), autocast(self.device, dtype=dtype):
                     hidden = self.model(x, output_hidden_states=True).hidden_states[layer_idx]
                     hidden = hidden.view(-1, self.hidden_size)
-                with torch.cuda.amp.autocast(dtype=dtype):
+                with autocast(self.device, dtype=dtype):
                     recon, activations = sae(hidden)
                     recon_loss = F.mse_loss(recon, hidden)
                     sparsity = (activations.abs() < 0.01).float().mean()
@@ -298,6 +309,7 @@ class AdaptiveCurriculumTrainer:
             val_metrics = self.validate(layer_idx, val_data)
             self.save_checkpoint(layer_idx, epoch, optimizer, scaler)
             self.log_metrics(layer_idx, epoch, avg_metrics["loss"], val_metrics, optimizer)
+
     def validate(self, layer_idx: int, val_data) -> FeatureMetrics:
         sae = self.saes[layer_idx]
         sae.eval()
@@ -321,6 +333,7 @@ class AdaptiveCurriculumTrainer:
         for field in FeatureMetrics.__dataclass_fields__:
             setattr(total, field, getattr(total, field) / num_batches)
         return total
+
     def log_metrics(self, layer_idx: int, epoch: int, train_loss: float, val_metrics: FeatureMetrics, optimizer) -> None:
         log_data = {f"layer_{layer_idx}/train_loss": train_loss, f"layer_{layer_idx}/lr": optimizer.param_groups[0]["lr"]}
         log_data.update({f"layer_{layer_idx}/val_{k}": v for k, v in vars(val_metrics).items()})
@@ -330,6 +343,7 @@ class AdaptiveCurriculumTrainer:
         print("Validation Metrics:")
         for key, value in vars(val_metrics).items():
             print(f"{key:>20}: {value:.4f}")
+
     def train_all(self, train_data, val_data, epochs: int = 50, batch_size: int = 64):
         for layer_idx in range(len(self.saes)):
             self.train_layer(layer_idx, train_data, val_data, epochs, batch_size)
